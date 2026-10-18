@@ -46,3 +46,10 @@ A generated link uses the address in the browser's address bar. To share outside
 - Uploads are public by default. Sign in and mark sensitive files private.
 - The chosen folder is remembered between launches; files, private flags, and Share Text snippets persist.
 - Admin session cookies are HttpOnly and SameSite=Strict, but this is a small local utility, not a hardened internet-facing service.
+
+
+## Standalone Windows release
+
+GitHub Releases publish a single `Blackbox-Share-Windows-x64.exe` file. The web interface is embedded into the executable at compile time; no `web` folder or ZIP is needed to run it. Runtime data such as `share-texts.json`, private-file metadata, and the selected-folder setting are created separately as user data.
+
+The release workflow builds with the Windows C runtime statically linked and uploads only the executable to the public GitHub Release. Push a `v*.*.*` tag to release, or run the workflow manually and optionally provide a tag name.

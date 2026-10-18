@@ -16,7 +16,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
-use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 const PORT: u16 = 1962;
@@ -379,7 +378,6 @@ async fn main() {
         .route("/api/upload", post(upload))
         .route("/api/private/:name", post(set_private))
         .route("/download/:name", get(download))
-        .nest_service("/assets", ServeDir::new("web/assets"))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(state);
 
