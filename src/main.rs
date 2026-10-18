@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, State},
@@ -13,7 +15,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -24,7 +26,8 @@ const META_FILE: &str = ".blackbox-share.json";
 const SHARE_TEXTS_FILE: &str = "share-texts.json";
 const MAX_SHARE_TEXT_CHARS: usize = 100_000;
 const APP_CONFIG_FILE: &str = "config.json";
-const STARTUP_SCRIPT: &str = "Blackbox Share.cmd";
+const STARTUP_SCRIPT: &str = "Blackbox Share.vbs";
+const LEGACY_STARTUP_SCRIPT: &str = "Blackbox Share.cmd";
 
 #[derive(Clone)]
 struct AppState {
@@ -219,9 +222,7 @@ async fn list_share_texts(State(state): State<AppState>) -> impl IntoResponse {
 async fn add_share_text(
     State(state): State<AppState>, headers: HeaderMap, Json(input): Json<NewShareText>
 ) -> Response {
-    if !is_admin(&headers, &state) {
-        return json_error(StatusCode::UNAUTHORIZED, "Admin login required");
-    }
+    let _ = headers; // Shared text is available to every LAN visitor.
     let title = input.title.trim();
     let content = input.content.trim();
     if content.is_empty() {
@@ -235,7 +236,12 @@ async fn add_share_text(
         title: if title.is_empty() { "Untitled text".to_string() } else { title.chars().take(100).collect() },
         content: content.to_string(),
     };
-    if let Ok(mut texts) = state.share_texts.lock() { texts.insert(0, item.clone()); }
+    if let Ok(mut texts) = state.share_texts.lock() {
+        if texts.len() >= 500 {
+            return json_error(StatusCode::TOO_MANY_REQUESTS, "The shared text list is full (500 items maximum)");
+        }
+        texts.insert(0, item.clone());
+    }
     match save_share_texts(&state) {
         Ok(()) => Json(item).into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
@@ -289,11 +295,15 @@ fn startup_enabled() -> bool {
 fn set_startup_enabled(enabled: bool) -> Result<bool, String> {
     #[cfg(windows)] {
         let path = startup_script_path().ok_or("Could not locate the Windows Startup folder")?;
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let legacy = PathBuf::from(appdata).join("Microsoft").join("Windows").join("Start Menu").join("Programs").join("Startup").join(LEGACY_STARTUP_SCRIPT);
+            if legacy.exists() { let _ = fs::remove_file(legacy); }
+        }
         if enabled {
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            let parent = exe.parent().ok_or("Could not locate the application folder")?;
             fs::create_dir_all(path.parent().ok_or("Invalid Startup folder")?).map_err(|e| e.to_string())?;
-            let script = format!("@echo off\r\ncd /d \"{}\"\r\nstart \"\" \"{}\"\r\ntimeout /t 2 /nobreak >nul\r\nstart \"\" http://127.0.0.1:1962\r\n", parent.display(), exe.display());
+            let exe_text = exe.display().to_string().replace('"', "\"\"");
+            let script = format!("Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run Chr(34) & \"{}\" & Chr(34), 0, False\r\n", exe_text);
             fs::write(&path, script).map_err(|e| e.to_string())?;
         } else if path.exists() {
             fs::remove_file(&path).map_err(|e| e.to_string())?;
@@ -318,6 +328,15 @@ async fn update_startup(State(state): State<AppState>, headers: HeaderMap, Json(
     }
 }
 
+async fn network_info() -> Json<serde_json::Value> {
+    let ip = local_ip();
+    Json(serde_json::json!({
+        "lan_ip": ip.to_string(),
+        "base_url": format!("http://{}:{}", ip, PORT),
+        "port": PORT
+    }))
+}
+
 async fn download(State(state): State<AppState>, headers: HeaderMap, Path(name): Path<String>) -> Response {
     let Some(name) = safe_name(&name) else { return json_error(StatusCode::BAD_REQUEST, "Invalid filename") };
     let private = state.private_files.lock().map(|s| s.contains(&name)).unwrap_or(false);
@@ -336,6 +355,56 @@ fn local_ip() -> IpAddr {
     std::net::UdpSocket::bind("0.0.0.0:0").ok()
         .and_then(|s| { s.connect("192.0.2.1:80").ok()?; s.local_addr().ok().map(|a| a.ip()) })
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+#[cfg(windows)]
+fn setup_tray() -> Result<tray_icon::TrayIcon, String> {
+    use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+    let menu = Menu::new();
+    let open_item = MenuItem::new("Open Blackbox Share", true, None);
+    let quit_item = MenuItem::new("Exit Blackbox Share", true, None);
+    menu.append(&open_item).map_err(|e| e.to_string())?;
+    menu.append(&PredefinedMenuItem::separator()).map_err(|e| e.to_string())?;
+    menu.append(&quit_item).map_err(|e| e.to_string())?;
+
+    // Small custom coffee-brown tray glyph, generated in memory.
+    let mut rgba = vec![0u8; 32 * 32 * 4];
+    for y in 0..32_i32 {
+        for x in 0..32_i32 {
+            let dx = x - 15;
+            let dy = y - 15;
+            if dx * dx + dy * dy <= 12 * 12 {
+                let i = ((y * 32 + x) * 4) as usize;
+                rgba[i] = 54; rgba[i + 1] = 36; rgba[i + 2] = 28; rgba[i + 3] = 255;
+                if (dx.abs() <= 5 && dy.abs() <= 7) || (dy.abs() <= 2 && dx.abs() <= 8) {
+                    rgba[i] = 249; rgba[i + 1] = 245; rgba[i + 2] = 243; rgba[i + 3] = 255;
+                }
+            }
+        }
+    }
+    let icon = Icon::from_rgba(rgba, 32, 32).map_err(|e| e.to_string())?;
+    let tray = TrayIconBuilder::new()
+        .with_tooltip("Blackbox Share · Port 1962")
+        .with_menu(Box::new(menu))
+        .with_icon(icon)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let open_id = open_item.id().clone();
+    let quit_id = quit_item.id().clone();
+    let receiver = MenuEvent::receiver();
+    std::thread::spawn(move || loop {
+        if let Ok(event) = receiver.recv() {
+            if event.id == open_id {
+                let _ = open::that(format!("http://127.0.0.1:{PORT}"));
+            } else if event.id == quit_id {
+                std::process::exit(0);
+            }
+        }
+    });
+    Ok(tray)
 }
 
 #[tokio::main]
@@ -369,6 +438,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/files", get(list_files))
+        .route("/api/network", get(network_info))
         .route("/api/texts", get(list_share_texts).post(add_share_text))
         .route("/api/texts/:id", axum::routing::delete(delete_share_text))
         .route("/api/login", post(login))
@@ -391,6 +461,13 @@ async fn main() {
     println!("Local:  http://127.0.0.1:{PORT}");
     println!("LAN:    http://{}:{PORT}", local_ip());
     println!("For internet sharing, configure router/firewall port forwarding and use your public IP.");
-    println!("Keep this window open while sharing. Ctrl+C to stop.");
+    println!("Blackbox Share runs in the system tray. Right-click its tray icon to open the dashboard or exit.");
+    println!("Made by Jelofen1962 · https://github.com/Jelofen1962");
+    #[cfg(windows)]
+    let _tray = match setup_tray() {
+        Ok(tray) => Some(tray),
+        Err(error) => { eprintln!("Could not create tray icon: {error}"); None }
+    };
+    let _ = open::that(format!("http://127.0.0.1:{PORT}"));
     if let Err(e) = axum::serve(listener, app).await { eprintln!("Server error: {e}"); }
 }
