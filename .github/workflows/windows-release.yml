@@ -48,7 +48,8 @@ jobs:
           Blackbox Share $version
 
           Run Blackbox-Share.exe. On first launch, choose the folder used for uploads and downloads.
-          The server listens on port 1962.
+          The server listens on port 1962. Sign in as admin and enable Launch with Windows to start
+          the server automatically at sign-in and open the local dashboard.
 
           Keep the web folder next to the executable. If Windows Firewall asks, allow access only on
           private networks unless you intentionally configured secure remote access.

@@ -24,6 +24,8 @@ const ADMIN_PASSWORD: &str = "Amir1962$#";
 const META_FILE: &str = ".blackbox-share.json";
 const SHARE_TEXTS_FILE: &str = "share-texts.json";
 const MAX_SHARE_TEXT_CHARS: usize = 100_000;
+const APP_CONFIG_FILE: &str = "config.json";
+const STARTUP_SCRIPT: &str = "Blackbox Share.cmd";
 
 #[derive(Clone)]
 struct AppState {
@@ -64,6 +66,12 @@ struct LoginInput { password: String }
 
 #[derive(Deserialize)]
 struct PrivateInput { private: bool }
+
+#[derive(Deserialize)]
+struct StartupInput { enabled: bool }
+
+#[derive(Serialize, Deserialize, Default)]
+struct AppConfig { folder: Option<PathBuf> }
 
 #[derive(Serialize)]
 struct LoginResult { ok: bool }
@@ -248,6 +256,69 @@ async fn delete_share_text(
     }
 }
 
+
+fn config_path() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("BlackboxShare").join(APP_CONFIG_FILE)
+}
+
+fn load_saved_folder() -> Option<PathBuf> {
+    let raw = fs::read_to_string(config_path()).ok()?;
+    let cfg: AppConfig = serde_json::from_str(&raw).ok()?;
+    let folder = cfg.folder?;
+    if folder.is_dir() { Some(folder) } else { None }
+}
+
+fn save_folder(folder: &FsPath) {
+    let path = config_path();
+    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    let cfg = AppConfig { folder: Some(folder.to_path_buf()) };
+    if let Ok(data) = serde_json::to_string_pretty(&cfg) { let _ = fs::write(path, data); }
+}
+
+fn startup_script_path() -> Option<PathBuf> {
+    #[cfg(windows)] {
+        let appdata = std::env::var_os("APPDATA")?;
+        return Some(PathBuf::from(appdata).join("Microsoft").join("Windows").join("Start Menu").join("Programs").join("Startup").join(STARTUP_SCRIPT));
+    }
+    #[cfg(not(windows))] { None }
+}
+
+fn startup_enabled() -> bool {
+    startup_script_path().map(|p| p.is_file()).unwrap_or(false)
+}
+
+fn set_startup_enabled(enabled: bool) -> Result<bool, String> {
+    #[cfg(windows)] {
+        let path = startup_script_path().ok_or("Could not locate the Windows Startup folder")?;
+        if enabled {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let parent = exe.parent().ok_or("Could not locate the application folder")?;
+            fs::create_dir_all(path.parent().ok_or("Invalid Startup folder")?).map_err(|e| e.to_string())?;
+            let script = format!("@echo off\r\ncd /d \"{}\"\r\nstart \"\" \"{}\"\r\ntimeout /t 2 /nobreak >nul\r\nstart \"\" http://127.0.0.1:1962\r\n", parent.display(), exe.display());
+            fs::write(&path, script).map_err(|e| e.to_string())?;
+        } else if path.exists() {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        return Ok(startup_enabled());
+    }
+    #[cfg(not(windows))] {
+        let _ = enabled;
+        Err("Automatic startup is supported in the Windows release only".to_string())
+    }
+}
+
+async fn get_startup(State(state): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"enabled": startup_enabled(), "supported": cfg!(windows), "admin": is_admin(&headers, &state)}))
+}
+
+async fn update_startup(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<StartupInput>) -> Response {
+    if !is_admin(&headers, &state) { return json_error(StatusCode::UNAUTHORIZED, "Admin login required"); }
+    match set_startup_enabled(input.enabled) {
+        Ok(enabled) => Json(serde_json::json!({"ok": true, "enabled": enabled})).into_response(),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
 async fn download(State(state): State<AppState>, headers: HeaderMap, Path(name): Path<String>) -> Response {
     let Some(name) = safe_name(&name) else { return json_error(StatusCode::BAD_REQUEST, "Invalid filename") };
     let private = state.private_files.lock().map(|s| s.contains(&name)).unwrap_or(false);
@@ -270,10 +341,24 @@ fn local_ip() -> IpAddr {
 
 #[tokio::main]
 async fn main() {
-    println!("Blackbox Share · choose a folder for shared files.");
-    let Some(folder) = rfd::FileDialog::new().set_title("Choose upload/download folder").pick_folder() else {
-        eprintln!("No folder selected. Exiting.");
-        return;
+    println!("\n  BLACKBOX / SHARE");
+    println!("  ──────────────────────────────────────");
+    println!("  Made by Jelofen1962 · https://github.com/Jelofen1962");
+    println!("  Starting file server...\n");
+    let folder = match load_saved_folder() {
+        Some(folder) => {
+            println!("Using saved folder: {}", folder.display());
+            folder
+        }
+        None => {
+            println!("Choose the folder used for uploads and downloads.");
+            let Some(folder) = rfd::FileDialog::new().set_title("Choose upload/download folder").pick_folder() else {
+                eprintln!("No folder selected. Exiting.");
+                return;
+            };
+            save_folder(&folder);
+            folder
+        }
     };
     if let Err(e) = fs::create_dir_all(&folder) { eprintln!("Cannot use folder: {e}"); return; }
     let state = AppState {
@@ -290,6 +375,7 @@ async fn main() {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/auth", get(auth_status))
+        .route("/api/startup", get(get_startup).post(update_startup))
         .route("/api/upload", post(upload))
         .route("/api/private/:name", post(set_private))
         .route("/download/:name", get(download))
@@ -303,6 +389,7 @@ async fn main() {
         Err(e) => { eprintln!("Could not bind port {PORT}: {e}"); return; }
     };
     println!("\nFolder: {}", folder.display());
+    println!("Made by Jelofen1962 · https://github.com/Jelofen1962");
     println!("Local:  http://127.0.0.1:{PORT}");
     println!("LAN:    http://{}:{PORT}", local_ip());
     println!("For internet sharing, configure router/firewall port forwarding and use your public IP.");
