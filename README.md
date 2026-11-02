@@ -7,13 +7,15 @@ The app runs in the Windows system tray, uses port **1962**, and stores files in
 ## Features
 
 - **Upload and download:** Drag files into the page or choose them from your device.
-- **Progress feedback:** Track file uploads and downloads.
+- **Progress feedback:** Track upload progress in the dashboard. Downloads are streamed directly by the browser, which manages their progress without loading the complete file into page memory.
+- **Large-file transfers:** Uploads stream to disk and downloads stream to the browser, avoiding loading the whole file into memory. Files up to 20 GiB are supported. Interrupted uploads retry automatically up to three times.
+- **Live file updates:** Open dashboards check for new files every four seconds and update without a manual refresh.
 - **Search and filters:** Find files by name, type, visibility, date, or size.
 - **LAN download links:** Any visitor can copy a download link that uses the server's local network IP address.
 - **Shared text:** Any visitor can add and copy text snippets. Cards show a short preview, while copy keeps the full text.
 - **Private files:** Admins can hide files from the public list and block public downloads.
 - **System tray:** Open the dashboard or exit from the tray menu. The release build does not open a command window.
-- **Windows startup:** Enable automatic launch at sign-in from the admin settings.
+- **Windows startup:** Automatic launch at Windows sign-in is enabled on first run. Admin settings can turn it off or back on.
 - **Single-file release:** GitHub Actions builds one standalone Windows x64 executable.
 
 ## Download and install
@@ -66,17 +68,11 @@ The app listens on `0.0.0.0:1962`. Windows Firewall must allow inbound traffic o
 
 The Windows release starts without a command window and creates a tray icon. Right-click the icon to open the dashboard or exit the app. The browser opens when the server starts.
 
-To start the app when you sign in to Windows:
-
-1. Open the dashboard and sign in as admin.
-2. Turn on **Launch with Windows**.
-3. Keep the executable at its current path.
-
-The app creates a hidden VBScript entry in your Windows Startup folder. Turn the setting off to remove it. If you move the executable, turn startup off and on again to update the saved path.
+The app enables **Launch with Windows** on its first run and creates a hidden VBScript entry in your Windows Startup folder. It starts when your Windows account signs in (not before the Windows sign-in screen). Sign in as admin to turn the setting off or back on. Keep the executable at its current path. If you move the executable, turn startup off and on again to update the saved path.
 
 ## Storage and configuration
 
-The first run asks you to choose a shared folder. The app remembers that folder in your user configuration. The folder stores shared files and these data files:
+The first run asks you to choose a shared folder. The app remembers that folder in your user configuration. Uploads stream to hidden temporary files and are renamed into place only after completion, so interrupted transfers do not appear as finished files. The folder stores shared files and these data files:
 
 | File | Purpose |
 | --- | --- |
@@ -145,6 +141,8 @@ You can also run **Actions → Windows Release → Run workflow**. A manual run 
 
 - **The page does not open:** Open `http://127.0.0.1:1962` manually. Check that another app is not using port `1962`.
 - **Another device cannot connect:** Confirm both devices use the same LAN and allow port `1962` through Windows Firewall on private networks.
+- **A large upload is interrupted:** The app retries temporary connection failures up to three times. A retry starts that file again; it does not resume from the exact byte where the connection stopped. Check that the shared drive has enough free space and keep the host computer awake during transfers.
+- **A new file is not visible immediately:** The dashboard checks for changes every four seconds. Use the Refresh button for an immediate check.
 - **A link does not work on another device:** Make sure the device is on the same network and that the host computer is still running Blackbox Share. The host's LAN IP can change when the router reconnects.
 - **The app is missing from the tray:** Check the hidden-icons area near the Windows clock. Restart the app if the icon is not there.
 - **Startup no longer works:** The executable may have moved. Turn off **Launch with Windows**, then turn it on again.

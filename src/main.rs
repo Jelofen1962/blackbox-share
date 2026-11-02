@@ -17,7 +17,7 @@ use std::{
     sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
-use tokio::net::TcpListener;
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 use uuid::Uuid;
 
 const PORT: u16 = 1962;
@@ -25,6 +25,8 @@ const ADMIN_PASSWORD: &str = "Amir1962$#";
 const META_FILE: &str = ".blackbox-share.json";
 const SHARE_TEXTS_FILE: &str = "share-texts.json";
 const MAX_SHARE_TEXT_CHARS: usize = 100_000;
+const MAX_UPLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB per file
+const MAX_REQUEST_BYTES: usize = MAX_UPLOAD_BYTES as usize + 1024 * 1024;
 const APP_CONFIG_FILE: &str = "config.json";
 const STARTUP_SCRIPT: &str = "Blackbox Share.vbs";
 const LEGACY_STARTUP_SCRIPT: &str = "Blackbox Share.cmd";
@@ -73,7 +75,14 @@ struct PrivateInput { private: bool }
 struct StartupInput { enabled: bool }
 
 #[derive(Serialize, Deserialize, Default)]
-struct AppConfig { folder: Option<PathBuf> }
+#[serde(default)]
+struct AppConfig {
+    folder: Option<PathBuf>,
+    // Missing fields in older config files default to false. The first upgraded
+    // Windows launch opts in once, while later user changes remain respected.
+    startup_configured: bool,
+    startup_enabled: bool,
+}
 
 #[derive(Serialize)]
 struct LoginResult { ok: bool }
@@ -86,6 +95,26 @@ fn safe_name(name: &str) -> Option<String> {
         return None;
     }
     Some(name.to_string())
+}
+
+fn content_disposition(name: &str) -> String {
+    // Keep an ASCII fallback for older clients and add RFC 5987 encoding so
+    // filenames containing Persian or other Unicode characters download intact.
+    let fallback = name.chars().map(|character| {
+        if character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '_' | '-') {
+            character
+        } else {
+            '_'
+        }
+    }).collect::<String>();
+    let encoded = name.as_bytes().iter().map(|byte| {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
+            (*byte as char).to_string()
+        } else {
+            format!("%{byte:02X}")
+        }
+    }).collect::<String>();
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 fn load_metadata(root: &FsPath) -> HashSet<String> {
@@ -166,22 +195,91 @@ async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Json<
 async fn upload(State(state): State<AppState>, headers: HeaderMap, mut multipart: Multipart) -> Response {
     let admin = is_admin(&headers, &state);
     let mut count = 0;
-    while let Ok(Some(field)) = multipart.next_field().await {
+
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => return json_error(StatusCode::BAD_REQUEST, &format!("Could not read upload: {error}")),
+        };
+
         let Some(raw_name) = field.file_name().map(str::to_string) else { continue };
-        let Some(name) = safe_name(&raw_name) else { return json_error(StatusCode::BAD_REQUEST, "Invalid filename") };
-        let data = match field.bytes().await { Ok(b) => b, Err(_) => return json_error(StatusCode::BAD_REQUEST, "Could not read upload") };
-        if data.len() > 1024 * 1024 * 1024 { return json_error(StatusCode::PAYLOAD_TOO_LARGE, "File exceeds 1 GB limit") }
-        if state.root.join(&name).exists() {
+        let Some(name) = safe_name(&raw_name) else {
+            return json_error(StatusCode::BAD_REQUEST, "Invalid filename");
+        };
+        let destination = state.root.join(&name);
+        if destination.exists() {
             return json_error(StatusCode::CONFLICT, "A file with this name already exists");
         }
-        if let Err(e) = fs::write(state.root.join(&name), &data) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+
+        // Write to a hidden temporary file as chunks arrive. This keeps memory use
+        // bounded for multi-gigabyte uploads and prevents partial files being listed.
+        let temporary = state.root.join(format!(".blackbox-upload-{}.tmp", Uuid::new_v4()));
+        let mut output = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+        };
+
+        let mut uploaded: u64 = 0;
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(error) => {
+                    drop(output);
+                    let _ = tokio::fs::remove_file(&temporary).await;
+                    return json_error(StatusCode::BAD_REQUEST, &format!("Upload stream interrupted: {error}"));
+                }
+            };
+
+            uploaded = uploaded.saturating_add(chunk.len() as u64);
+            if uploaded > MAX_UPLOAD_BYTES {
+                drop(output);
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return json_error(StatusCode::PAYLOAD_TOO_LARGE, "File exceeds the 20 GiB limit");
+            }
+
+            if let Err(error) = output.write_all(&chunk).await {
+                drop(output);
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Could not save upload: {error}"));
+            }
         }
+
+        if let Err(error) = output.flush().await {
+            drop(output);
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Could not finish upload: {error}"));
+        }
+        if let Err(error) = output.sync_all().await {
+            drop(output);
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Could not finish upload: {error}"));
+        }
+        drop(output);
+
+        // Check again after receiving the stream in case another client uploaded
+        // the same name at the same time.
+        if destination.exists() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return json_error(StatusCode::CONFLICT, "A file with this name already exists");
+        }
+        if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Could not publish uploaded file: {error}"));
+        }
+
         if !admin {
             // New uploads are public by default. Admin can mark them private afterwards.
         }
         count += 1;
     }
+
     Json(serde_json::json!({"ok":true,"uploaded":count})).into_response()
 }
 
@@ -266,18 +364,31 @@ fn config_path() -> PathBuf {
     dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("BlackboxShare").join(APP_CONFIG_FILE)
 }
 
+fn load_app_config() -> AppConfig {
+    fs::read_to_string(config_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<AppConfig>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_app_config(config: &AppConfig) -> Result<(), String> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let data = serde_json::to_string_pretty(config).map_err(|error| error.to_string())?;
+    fs::write(path, data).map_err(|error| error.to_string())
+}
+
 fn load_saved_folder() -> Option<PathBuf> {
-    let raw = fs::read_to_string(config_path()).ok()?;
-    let cfg: AppConfig = serde_json::from_str(&raw).ok()?;
-    let folder = cfg.folder?;
+    let folder = load_app_config().folder?;
     if folder.is_dir() { Some(folder) } else { None }
 }
 
 fn save_folder(folder: &FsPath) {
-    let path = config_path();
-    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
-    let cfg = AppConfig { folder: Some(folder.to_path_buf()) };
-    if let Ok(data) = serde_json::to_string_pretty(&cfg) { let _ = fs::write(path, data); }
+    let mut config = load_app_config();
+    config.folder = Some(folder.to_path_buf());
+    let _ = save_app_config(&config);
 }
 
 fn startup_script_path() -> Option<PathBuf> {
@@ -308,7 +419,12 @@ fn set_startup_enabled(enabled: bool) -> Result<bool, String> {
         } else if path.exists() {
             fs::remove_file(&path).map_err(|e| e.to_string())?;
         }
-        return Ok(startup_enabled());
+        let enabled_now = startup_enabled();
+        let mut config = load_app_config();
+        config.startup_configured = true;
+        config.startup_enabled = enabled_now;
+        save_app_config(&config)?;
+        return Ok(enabled_now);
     }
     #[cfg(not(windows))] {
         let _ = enabled;
@@ -342,12 +458,19 @@ async fn download(State(state): State<AppState>, headers: HeaderMap, Path(name):
     let private = state.private_files.lock().map(|s| s.contains(&name)).unwrap_or(false);
     if private && !is_admin(&headers, &state) { return json_error(StatusCode::NOT_FOUND, "File not found"); }
     let path = state.root.join(&name);
-    let Ok(data) = tokio::fs::read(&path).await else { return json_error(StatusCode::NOT_FOUND, "File not found") };
+    let Ok(file) = tokio::fs::File::open(&path).await else {
+        return json_error(StatusCode::NOT_FOUND, "File not found");
+    };
+    let Ok(metadata) = file.metadata().await else {
+        return json_error(StatusCode::NOT_FOUND, "File not found");
+    };
     let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
-    let mut response = Response::new(Body::from(data));
+    let stream = tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024);
+    let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap_or(HeaderValue::from_static("application/octet-stream")));
-    response.headers_mut().insert(header::CONTENT_DISPOSITION, HeaderValue::from_str(&format!("attachment; filename=\"{}\"", name.replace('"', ""))).unwrap());
+    response.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from_str(&metadata.len().to_string()).unwrap_or(HeaderValue::from_static("0")));
+    response.headers_mut().insert(header::CONTENT_DISPOSITION, HeaderValue::from_str(&content_disposition(&name)).unwrap_or(HeaderValue::from_static("attachment")));
     response
 }
 
@@ -429,6 +552,26 @@ async fn main() {
         }
     };
     if let Err(e) = fs::create_dir_all(&folder) { eprintln!("Cannot use folder: {e}"); return; }
+
+    // Opt in to Windows sign-in startup once on first run. The admin switch can
+    // still disable it, and that choice is persisted across future launches.
+    #[cfg(windows)]
+    {
+        let mut config = load_app_config();
+        if !config.startup_configured {
+            match set_startup_enabled(true) {
+                Ok(enabled) => {
+                    config.startup_configured = true;
+                    config.startup_enabled = enabled;
+                    if let Err(error) = save_app_config(&config) {
+                        eprintln!("Could not save startup preference: {error}");
+                    }
+                }
+                Err(error) => eprintln!("Could not enable Windows startup: {error}"),
+            }
+        }
+    }
+
     let state = AppState {
         private_files: Arc::new(Mutex::new(load_metadata(&folder))),
         share_texts: Arc::new(Mutex::new(load_share_texts(&folder))),
@@ -448,7 +591,7 @@ async fn main() {
         .route("/api/upload", post(upload))
         .route("/api/private/:name", post(set_private))
         .route("/download/:name", get(download))
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], PORT));
