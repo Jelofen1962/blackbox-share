@@ -8,7 +8,7 @@ The app runs in the Windows system tray, uses port **1962**, and stores files in
 
 - **Upload and download:** Drag files into the page or choose them from your device.
 - **Progress feedback:** Track upload progress in the dashboard. Downloads are streamed directly by the browser, which manages their progress without loading the complete file into page memory.
-- **Large-file transfers:** Uploads stream to disk and downloads stream to the browser, avoiding loading the whole file into memory. Files up to 20 GiB are supported. Interrupted uploads retry automatically up to three times.
+- **Large-file transfers:** Uploads stream to disk and downloads stream to the browser, avoiding loading the whole file into memory. Files up to 20 GiB are supported. Interrupted uploads retry automatically up to three times. Concurrent transfers queue automatically and low disk space is detected before filling the drive.
 - **Live file updates:** Open dashboards check for new files every four seconds and update without a manual refresh.
 - **Search and filters:** Find files by name, type, visibility, date, or size.
 - **LAN download links:** Any visitor can copy a download link that uses the server's local network IP address.
@@ -53,7 +53,9 @@ Any visitor can add text. Only the admin can delete saved text. The app stores s
 
 Select **Admin login** to manage private files, delete shared text, and change startup settings.
 
-The default admin password in this build is `Amir1962$#`. Change it in `src/main.rs` before building a version for wider use. This password is compiled into the app, so do not treat this starter build as suitable for an untrusted public network.
+There is **no built-in admin password**. On the host PC, open `http://127.0.0.1:1962`, click **Set up admin**, and choose your own password (at least 8 characters). You only need to do this once. Existing installations upgrading from a hardcoded-password build need to complete this one-time setup; the old password no longer works. The new admin password is stored as an Argon2 password hash in the per-user config, not in the executable.
+
+**Upload and download require no account or password.** The admin password is only for the optional private-file switch, shared-text deletion, and Windows startup settings. Files marked private remain accessible only to the logged-in admin. Leave files public for frictionless local sharing.
 
 ### Use it from another device
 
@@ -78,9 +80,9 @@ The first run asks you to choose a shared folder. The app remembers that folder 
 | --- | --- |
 | `share-texts.json` | Shared text snippets |
 | `.blackbox-share.json` | Private-file flags |
-| `config.json` | Saved folder path, stored in the user's app config directory rather than the shared folder |
+| `config.json` | Saved folder path, startup options and Argon2 admin password hash, stored in the user's app config directory rather than the shared folder |
 
-Do not delete the JSON files if you want to keep their settings and shared text. Back up the shared folder to keep your data safe.
+Do not delete the JSON files if you want to keep their settings and shared text. Back up the shared folder and your per-user app config to keep your data safe. If privacy metadata is corrupted or inaccessible, the server refuses to start instead of accidentally publishing previously private files. Text data is also loaded strictly to avoid silently losing snippets.
 
 ## Build from source
 
@@ -159,3 +161,21 @@ No license file is included yet. Add a `LICENSE` file before redistributing this
 ## Credits
 
 Made by [Jelofen1962](https://github.com/Jelofen1962).
+
+## Version 1.1.0 reliability changes
+
+- Preserves the password-free LAN file upload and public download experience.
+- First-run localhost-only admin password setup replaces the previously hardcoded password.
+- Locks admin sessions to a real 12-hour lifetime and limits repeated failed admin login attempts only.
+- Prevents casing-based private-file access on Windows and excludes symlinks/reparse points from the shared library.
+- Fails closed on unreadable/corrupted private-file metadata; no automatic reset to public.
+- Writes privacy settings, shared text, and app configuration with temporary files and atomic replacement. In-memory changes happen only after successful storage.
+- Limits JSON request sizes independently of the 20 GiB streaming upload route.
+- Preserves at least 256 MiB available storage during uploads, and queues up to three simultaneous server-side transfers.
+- Publishes uploads atomically without overwriting an existing file (including same-name races). Uses Win32 MoveFileW on Windows to work with removable drives.
+- Removes stale temporary upload files older than 24 hours on startup.
+- Hides internal shared-text data from the regular file browser and prevents users from overwriting its filename.
+- Displays errors for Windows port conflicts and tray initialization issues.
+- Adds Rust regression tests and runs them in the Windows release workflow.
+
+The service is designed for **trusted LANs only**. HTTP is kept intentionally for simple local sharing. Do not expose port 1962 directly to the public internet. A guest can upload public files without login; this is by design.
