@@ -1,10 +1,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use axum::{
-    body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State, Query},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Response, sse::{Event, Sse, KeepAlive}},
     routing::{get, post},
     Json, Router,
 };
@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Semaphore};
+use tokio::{io::{AsyncWriteExt, AsyncReadExt, AsyncSeekExt}, net::TcpListener, sync::{Semaphore, broadcast}};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use uuid::Uuid;
 
@@ -26,14 +26,13 @@ const PORT: u16 = 1962;
 const ADMIN_SESSION_DURATION: Duration = Duration::from_secs(12 * 60 * 60);
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_FAILED_LOGINS: usize = 6;
-const MIN_FREE_DISK_BYTES: u64 = 256 * 1024 * 1024;
+const MIN_FREE_DISK_BYTES: u64 = 0; // No artificial reserve; only actual disk capacity
 const MAX_PARALLEL_UPLOADS: usize = 3;
 const JSON_BODY_LIMIT: usize = 512 * 1024;
 const META_FILE: &str = ".blackbox-share.json";
 const SHARE_TEXTS_FILE: &str = "share-texts.json";
 const MAX_SHARE_TEXT_CHARS: usize = 100_000;
-const MAX_UPLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB per file
-const MAX_REQUEST_BYTES: usize = MAX_UPLOAD_BYTES as usize + 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024; // Chunk/request cap only; no per-file size limit
 const APP_CONFIG_FILE: &str = "config.json";
 const STARTUP_SCRIPT: &str = "Blackbox Share.vbs";
 const LEGACY_STARTUP_SCRIPT: &str = "Blackbox Share.cmd";
@@ -47,6 +46,10 @@ struct AppState {
     admin_password_hash: Arc<Mutex<Option<String>>>,
     failed_logins: Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>,
     upload_slots: Arc<Semaphore>,
+    transfers: Arc<Mutex<HashMap<String, TransferSession>>>,
+    finished_transfers: Arc<Mutex<HashMap<String, (u64, Instant)>>>,
+    devices: Arc<Mutex<HashMap<String, DeviceInfo>>>,
+    changes: broadcast::Sender<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -73,6 +76,8 @@ struct FileItem {
     size: u64,
     modified: u64,
     private: bool,
+    directory: bool,
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -243,7 +248,7 @@ async fn list_files(State(state): State<AppState>, headers: HeaderMap) -> impl I
             if !admin && private.contains(&name) { continue; }
             let Ok(meta) = fs::metadata(&path) else { continue };
             let modified = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-            files.push(FileItem { name: name.clone(), size: meta.len(), modified, private: private.contains(&name) });
+            files.push(FileItem { name: name.clone(), size: meta.len(), modified, private: private.contains(&name), directory:false, path:name });
         }
     }
     files.sort_by(|a,b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -364,11 +369,6 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
             };
 
             uploaded = uploaded.saturating_add(chunk.len() as u64);
-            if uploaded > MAX_UPLOAD_BYTES {
-                drop(output);
-                let _ = tokio::fs::remove_file(&temporary).await;
-                return json_error(StatusCode::PAYLOAD_TOO_LARGE, "File exceeds the 20 GiB limit");
-            }
 
             // Keep a little free space for the operating system. Check in large
             // intervals so this does not slow down every streaming chunk.
@@ -422,6 +422,7 @@ async fn upload(State(state): State<AppState>, mut multipart: Multipart) -> Resp
         count += 1;
     }
 
+    let _ = state.changes.send("files".into());
     Json(serde_json::json!({"ok":true,"uploaded":count})).into_response()
 }
 
@@ -442,6 +443,7 @@ async fn set_private(
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error);
     }
     *current = proposed;
+    let _ = state.changes.send("files".into());
     Json(serde_json::json!({"ok":true})).into_response()
 }
 
@@ -494,6 +496,7 @@ async fn add_share_text(
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error);
     }
     *texts = proposed;
+    let _ = state.changes.send("texts".into());
     Json(item).into_response()
 }
 
@@ -512,6 +515,7 @@ async fn delete_share_text(
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error);
     }
     *texts = proposed;
+    let _ = state.changes.send("texts".into());
     Json(serde_json::json!({"ok":true})).into_response()
 }
 
@@ -618,34 +622,443 @@ async fn network_info() -> Json<serde_json::Value> {
     }))
 }
 
-async fn download(State(state): State<AppState>, headers: HeaderMap, Path(name): Path<String>) -> Response {
-    let Some(name) = safe_name(&name) else { return json_error(StatusCode::BAD_REQUEST, "Invalid filename") };
-    // Always resolve an actual, case-exact, non-symlink directory entry before
-    // checking private status. Ordinary public downloads need no login.
-    let Some(path) = safe_existing_file(&state.root, &name) else {
-        return json_error(StatusCode::NOT_FOUND, "File not found");
+#[derive(Deserialize, Default)]
+struct DownloadOptions { inline: Option<bool> }
+
+async fn download(State(state): State<AppState>, headers: HeaderMap, Path(name): Path<String>, Query(options): Query<DownloadOptions>) -> Response {
+    serve_download(&state, &headers, &name, options.inline.unwrap_or(false)).await
+}
+
+async fn download_nested(State(state): State<AppState>, headers: HeaderMap, Path(name): Path<String>, Query(options): Query<DownloadOptions>) -> Response {
+    serve_download(&state, &headers, &name, options.inline.unwrap_or(false)).await
+}
+
+async fn serve_download(state: &AppState, headers: &HeaderMap, name: &str, inline: bool) -> Response {
+    let path = match resolve_relative(&state.root, name, true) {
+        Ok(path) if path.is_file() => path,
+        _ => return json_error(StatusCode::NOT_FOUND, "File not found"),
     };
     let private = match state.private_files.lock() {
-        Ok(private) => private.contains(&name),
+        Ok(guard) => guard.contains(name),
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "File visibility unavailable"),
     };
-    if private && !is_admin(&headers, &state) {
+    if private && !is_admin(headers, state) {
         return json_error(StatusCode::NOT_FOUND, "File not found");
     }
-    let Ok(file) = tokio::fs::File::open(&path).await else {
-        return json_error(StatusCode::NOT_FOUND, "File not found");
-    };
-    let Ok(metadata) = file.metadata().await else {
-        return json_error(StatusCode::NOT_FOUND, "File not found");
-    };
-    let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
-    let stream = tokio_util::io::ReaderStream::with_capacity(file, 64 * 1024);
+    let Ok(mut file) = tokio::fs::File::open(&path).await else { return json_error(StatusCode::NOT_FOUND,"File unavailable") };
+    let Ok(meta) = file.metadata().await else { return json_error(StatusCode::NOT_FOUND,"File unavailable") };
+    let size = meta.len();
+    let mut start = 0_u64;
+    let mut end = size.saturating_sub(1);
+    let mut partial = false;
+    if let Some(raw) = headers.get(header::RANGE).and_then(|v|v.to_str().ok()) {
+        let Some((left, right)) = raw.strip_prefix("bytes=").and_then(|s|s.split_once('-')) else {
+            return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+        };
+        if left.is_empty() {
+            let Ok(suffix) = right.parse::<u64>() else { return StatusCode::RANGE_NOT_SATISFIABLE.into_response() };
+            if suffix == 0 || size == 0 { return StatusCode::RANGE_NOT_SATISFIABLE.into_response() }
+            start = size.saturating_sub(suffix);
+        } else {
+            let Ok(n) = left.parse::<u64>() else { return StatusCode::RANGE_NOT_SATISFIABLE.into_response() };
+            start = n;
+            if !right.is_empty() {
+                let Ok(n) = right.parse::<u64>() else { return StatusCode::RANGE_NOT_SATISFIABLE.into_response() };
+                end = n.min(size.saturating_sub(1));
+            }
+        }
+        if start >= size || end < start { return (StatusCode::RANGE_NOT_SATISFIABLE,[(header::CONTENT_RANGE, format!("bytes */{size}"))]).into_response() }
+        partial = true;
+    }
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() { return StatusCode::INTERNAL_SERVER_ERROR.into_response() }
+    let length = if size == 0 { 0 } else { end-start+1 };
+    let stream = tokio_util::io::ReaderStream::with_capacity(file.take(length), 64*1024);
     let mut response = Response::new(Body::from_stream(stream));
-    *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap_or(HeaderValue::from_static("application/octet-stream")));
-    response.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from_str(&metadata.len().to_string()).unwrap_or(HeaderValue::from_static("0")));
-    response.headers_mut().insert(header::CONTENT_DISPOSITION, HeaderValue::from_str(&content_disposition(&name)).unwrap_or(HeaderValue::from_static("attachment")));
+    *response.status_mut() = if partial {StatusCode::PARTIAL_CONTENT} else {StatusCode::OK};
+    let mime = mime_guess::from_path(&path).first_or_octet_stream().to_string();
+    let disposition = if inline { "inline".to_string() } else { content_disposition(path.file_name().and_then(|n|n.to_str()).unwrap_or("file")) };
+    for (key,value) in [(header::CONTENT_TYPE,mime),(header::CONTENT_LENGTH,length.to_string()),(header::CONTENT_DISPOSITION,disposition),(header::ACCEPT_RANGES,"bytes".into())] {
+        if let Ok(h) = HeaderValue::from_str(&value) { response.headers_mut().insert(key,h); }
+    }
+    if partial { if let Ok(v)=HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")){ response.headers_mut().insert(header::CONTENT_RANGE,v); } }
+    response.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS,HeaderValue::from_static("nosniff"));
     response
+}
+
+// v1.2: path-aware library operations, resumable chunk transfers and live events.
+#[derive(Clone)]
+struct TransferSession {
+    destination: PathBuf,
+    temporary: PathBuf,
+    written: u64,
+    total: u64,
+    touched: Instant,
+}
+#[derive(Clone, Serialize)]
+struct DeviceInfo {
+    name: String,
+    ip: String,
+    last_seen: u64,
+}
+#[derive(Deserialize)]
+struct FolderQuery { path: Option<String> }
+#[derive(Deserialize)]
+struct ManageInput { action: String, path: String, destination: Option<String> }
+#[derive(Deserialize)]
+struct ChunkInput { id: String, path: String, offset: u64, total: u64, final_chunk: bool }
+#[derive(Deserialize)]
+struct CancelInput { id: String }
+#[derive(Deserialize)]
+struct PresenceInput { id: String, name: Option<String> }
+#[derive(Deserialize)]
+struct EditTextInput { id: String, title: String, content: String }
+
+fn components(input: &str) -> Result<Vec<&str>, String> {
+    let trimmed = input.trim_matches('/');
+    if trimmed.is_empty() { return Ok(Vec::new()); }
+    let mut result=Vec::new();
+    for part in trimmed.split('/') {
+        if safe_name(part).is_none() || part == META_FILE || part.starts_with(".blackbox-") {
+            return Err("Invalid path component".into());
+        }
+        result.push(part);
+    }
+    Ok(result)
+}
+
+// Resolve each entry using exact capitalization. Never traverse symlinks,
+// Windows directory junctions, reserved metadata or paths outside the root.
+fn resolve_relative(root: &FsPath, relative: &str, must_exist: bool) -> Result<PathBuf,String> {
+    let parts=components(relative)?;
+    let mut current=root.to_path_buf();
+    for (index,part) in parts.iter().enumerate() {
+        let last=index+1==parts.len();
+        let entry=fs::read_dir(&current).map_err(|e|e.to_string())?
+            .filter_map(Result::ok)
+            .find(|entry|entry.file_name().to_str()==Some(*part));
+        match entry {
+            Some(entry) => {
+                let typ=entry.file_type().map_err(|e|e.to_string())?;
+                if typ.is_symlink() { return Err("Links are not accessible".into()); }
+                let canonical=fs::canonicalize(entry.path()).map_err(|e|e.to_string())?;
+                if !canonical.starts_with(root) { return Err("Path escapes shared folder".into()); }
+                if !last && !typ.is_dir() { return Err("Not a directory".into()); }
+                current=canonical;
+            }
+            None if last && !must_exist => { current=current.join(part); }
+            None => return Err("Path not found".into()),
+        }
+    }
+    Ok(current)
+}
+fn rel_key(relative: &str) -> String { relative.trim_matches('/').replace('\\',"/") }
+fn private_paths_in_directory(private: &HashSet<String>, prefix: &str) -> Vec<String> {
+    private.iter().filter(|key|*key==prefix || key.starts_with(&format!("{prefix}/"))).cloned().collect()
+}
+
+async fn list_tree(State(state):State<AppState>,headers:HeaderMap,Query(query):Query<FolderQuery>) -> Response {
+    let relative=query.path.unwrap_or_default();
+    let folder=match resolve_relative(&state.root,&relative,true) {
+        Ok(path) if path.is_dir()=>path,
+        _=>return json_error(StatusCode::NOT_FOUND,"Folder not found"),
+    };
+    let parent=rel_key(&relative);
+    let admin=is_admin(&headers,&state);
+    let private=match state.private_files.lock(){Ok(p)=>p.clone(),Err(_)=>return json_error(StatusCode::INTERNAL_SERVER_ERROR,"Privacy unavailable")};
+    let mut items=Vec::new();
+    if let Ok(entries)=fs::read_dir(folder) {
+        for entry in entries.flatten() {
+            let Some(name)=entry.file_name().to_str().map(str::to_string) else {continue};
+            if safe_name(&name).is_none() || name==META_FILE {continue}
+            let Ok(typ)=entry.file_type() else {continue};
+            if !typ.is_dir() && !typ.is_file() {continue}
+            let Ok(real)=fs::canonicalize(entry.path()) else {continue};
+            if !real.starts_with(&state.root) {continue}
+            let path=if parent.is_empty(){name.clone()}else{format!("{parent}/{name}")};
+            let hidden=private.contains(&path);
+            if hidden && !admin {continue}
+            let Ok(meta)=entry.metadata() else {continue};
+            let modified=meta.modified().ok().and_then(|m|m.duration_since(UNIX_EPOCH).ok()).map(|d|d.as_secs()).unwrap_or(0);
+            items.push(FileItem{name,path,size:if typ.is_dir(){0}else{meta.len()},modified,private:hidden,directory:typ.is_dir()});
+        }
+    }
+    items.sort_by(|a,b|b.directory.cmp(&a.directory).then_with(||a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Json(serde_json::json!({"path":parent,"items":items})).into_response()
+}
+
+async fn manage_file(State(state):State<AppState>,Json(input):Json<ManageInput>)->Response {
+    let source=rel_key(&input.path);
+    if source.is_empty(){return json_error(StatusCode::BAD_REQUEST,"Cannot modify the library root")}
+    let existing=match resolve_relative(&state.root,&source,true){Ok(path)=>path,Err(e)=>return json_error(StatusCode::BAD_REQUEST,&e)};
+    if input.action=="mkdir" {
+        return json_error(StatusCode::BAD_REQUEST,"Create a directory using action create_folder and a new path");
+    }
+    // Hold the privacy lock across filesystem changes and metadata publication.
+    // This avoids briefly exposing a renamed private file as public.
+    let Ok(mut private)=state.private_files.lock() else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR,"Privacy state unavailable");
+    };
+    let result: Result<(),String>=match input.action.as_str() {
+        "delete" => {
+            let r=if existing.is_dir(){fs::remove_dir_all(&existing)}else{fs::remove_file(&existing)};
+            r.map_err(|e|e.to_string())
+        },
+        "rename"|"move" => {
+            let Some(target)=input.destination.as_deref() else{return json_error(StatusCode::BAD_REQUEST,"Destination missing")};
+            let target=rel_key(target);
+            if target==source || target.starts_with(&format!("{source}/")) {return json_error(StatusCode::BAD_REQUEST,"Cannot move a folder into itself")}
+            match resolve_relative(&state.root,&target,false) {
+                Ok(destination)=>{
+                    if destination.exists(){Err("Destination already exists".into())}
+                    else {fs::rename(&existing,&destination).map_err(|e|e.to_string())}
+                },Err(e)=>Err(e)
+            }
+        },
+        _=>Err("Unknown action".into()),
+    };
+    if let Err(e)=result{return json_error(StatusCode::CONFLICT,&e)}
+    {
+        let mut proposed=private.clone();
+        for old in private_paths_in_directory(&private,&source) {
+            proposed.remove(&old);
+            if input.action!="delete" {
+                if let Some(target)=input.destination.as_deref() {
+                    proposed.insert(format!("{}{}",rel_key(target),&old[source.len()..]));
+                }
+            }
+        }
+        if let Err(e)=persist_metadata(&state.root,&proposed){
+            // Roll back a rename/move when the visibility change cannot be saved.
+            // Deletes cannot be rolled back, but they cannot expose deleted content.
+            if input.action=="rename" || input.action=="move" {
+                if let Some(target)=input.destination.as_deref() {
+                    if let Ok(destination)=resolve_relative(&state.root,target,true) {
+                        let _=fs::rename(destination,&existing);
+                    }
+                }
+            }
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR,&format!("Could not save file visibility: {e}"));
+        }
+        *private=proposed;
+    }
+    let _=state.changes.send("files".into());
+    Json(serde_json::json!({"ok":true})).into_response()
+}
+
+async fn create_folder(State(state):State<AppState>,Json(input):Json<ManageInput>)->Response {
+    if input.action!="create_folder" {return json_error(StatusCode::BAD_REQUEST,"Invalid operation")}
+    let path=match resolve_relative(&state.root,&input.path,false){Ok(p)=>p,Err(e)=>return json_error(StatusCode::BAD_REQUEST,&e)};
+    if path==state.root || path.exists(){return json_error(StatusCode::CONFLICT,"Folder already exists")}
+    if let Err(e)=fs::create_dir(&path){return json_error(StatusCode::BAD_REQUEST,&e.to_string())}
+    let _=state.changes.send("files".into());
+    Json(serde_json::json!({"ok":true})).into_response()
+}
+
+async fn upload_chunk(State(state):State<AppState>,Query(request):Query<ChunkInput>,mut multipart:Multipart)->Response {
+    if request.id.len()>100 || request.id.is_empty() || !request.id.chars().all(|c|c.is_ascii_alphanumeric()||c=='-') {
+        return json_error(StatusCode::BAD_REQUEST,"Invalid transfer ID");
+    }
+    let path=rel_key(&request.path);
+    let destination=match resolve_relative(&state.root,&path,false){Ok(p)=>p,Err(e)=>return json_error(StatusCode::BAD_REQUEST,&e)};
+    if destination==state.root {return json_error(StatusCode::BAD_REQUEST,"Invalid upload target")}
+    let field=match multipart.next_field().await {
+        Ok(Some(f))=>f,_=>return json_error(StatusCode::BAD_REQUEST,"Missing chunk")
+    };
+    let bytes=match field.bytes().await {Ok(data)=>data,Err(e)=>return json_error(StatusCode::BAD_REQUEST,&e.to_string())};
+    if bytes.len()>8*1024*1024 {return json_error(StatusCode::PAYLOAD_TOO_LARGE,"Chunk larger than 8 MiB")}
+    let Ok(mut sessions)=state.transfers.lock() else {return json_error(StatusCode::INTERNAL_SERVER_ERROR,"Transfer unavailable")};
+    if !sessions.contains_key(&request.id) {
+        if request.offset!=0 {return json_error(StatusCode::CONFLICT,"Transfer not found; restart from zero")}
+        if destination.exists(){return json_error(StatusCode::CONFLICT,"Target already exists")}
+        let temporary=state.root.join(format!(".blackbox-upload-{}.tmp",Uuid::new_v4()));
+        sessions.insert(request.id.clone(),TransferSession{destination:destination.clone(),temporary,written:0,total:request.total,touched:Instant::now()});
+    }
+    let session=sessions.get_mut(&request.id).unwrap();
+    if session.destination!=destination || session.total!=request.total {return json_error(StatusCode::CONFLICT,"Transfer details changed")}
+    if request.offset!=session.written {return Json(serde_json::json!({"ok":true,"offset":session.written,"complete":false})).into_response()}
+    if (bytes.len() as u64)>request.total.saturating_sub(session.written) {return json_error(StatusCode::BAD_REQUEST,"Chunk exceeds declared file size")}
+    let available=fs2::available_space(&state.root).unwrap_or(0);
+    if available<(bytes.len() as u64) {return json_error(StatusCode::INSUFFICIENT_STORAGE,"Disk full")}
+    let mut file=match fs::OpenOptions::new().create(true).append(true).open(&session.temporary) {
+        Ok(f)=>f,Err(e)=>return json_error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())
+    };
+    if let Err(e)=file.write_all(&bytes){return json_error(StatusCode::INSUFFICIENT_STORAGE,&e.to_string())}
+    session.written+=bytes.len() as u64;
+    session.touched=Instant::now();
+    let offset=session.written;
+    if request.final_chunk {
+        if offset!=request.total {return json_error(StatusCode::CONFLICT,"Final chunk does not match expected size")}
+        if let Err(e)=file.sync_all(){return json_error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())}
+        drop(file);
+        if let Err(e)=publish_upload(&session.temporary,&session.destination){return json_error(StatusCode::CONFLICT,&format!("Could not finish transfer: {e}"))}
+        let _=fs::remove_file(&session.temporary);
+        sessions.remove(&request.id);
+        drop(sessions);
+        if let Ok(mut done)=state.finished_transfers.lock(){done.insert(request.id.clone(),(offset,Instant::now()));}
+        let _=state.changes.send("files".into());
+        return Json(serde_json::json!({"ok":true,"offset":offset,"complete":true})).into_response();
+    }
+    Json(serde_json::json!({"ok":true,"offset":offset,"complete":false})).into_response()
+}
+async fn query_chunk(State(state):State<AppState>,Query(query):Query<CancelInput>)->Response {
+    let offset=state.transfers.lock().ok().and_then(|sessions|sessions.get(&query.id).map(|s|s.written));
+    let completed=state.finished_transfers.lock().ok().and_then(|done|done.get(&query.id).map(|v|v.0));
+    Json(serde_json::json!({"offset":offset.or(completed),"complete":completed.is_some()})).into_response()
+}
+async fn cancel_chunk(State(state):State<AppState>,Json(query):Json<CancelInput>)->Response {
+    if let Ok(mut sessions)=state.transfers.lock(){
+        if let Some(session)=sessions.remove(&query.id){let _=fs::remove_file(session.temporary);}
+    }
+    Json(serde_json::json!({"ok":true})).into_response()
+}
+async fn event_stream(State(state):State<AppState>)->Sse<impl tokio_stream::Stream<Item=Result<Event,std::convert::Infallible>>> {
+    let mut receiver=state.changes.subscribe();
+    let events=async_stream::stream! {
+        yield Ok(Event::default().data("ready"));
+        loop {
+            match receiver.recv().await {
+                Ok(value)=>yield Ok(Event::default().data(value)),
+                Err(broadcast::error::RecvError::Lagged(_))=>yield Ok(Event::default().data("refresh")),
+                Err(broadcast::error::RecvError::Closed)=>break,
+            }
+        }
+    };
+    Sse::new(events).keep_alive(KeepAlive::default())
+}
+async fn heartbeat(State(state):State<AppState>,ConnectInfo(peer):ConnectInfo<SocketAddr>,Json(body):Json<PresenceInput>)->Response {
+    if body.id.len()>100 || body.id.is_empty() {return json_error(StatusCode::BAD_REQUEST,"Invalid device ID")}
+    let Ok(mut devices)=state.devices.lock() else {return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    devices.retain(|_,v|now.saturating_sub(v.last_seen)<45);
+    let name=body.name.unwrap_or_else(||"Browser".into()).chars().take(60).collect();
+    devices.insert(format!("{}:{}",peer.ip(),body.id),DeviceInfo{name,ip:peer.ip().to_string(),last_seen:now});
+    Json(serde_json::json!({"ok":true})).into_response()
+}
+async fn dashboard(State(state):State<AppState>)->Response {
+    let total=fs2::total_space(&state.root).unwrap_or(0);
+    let free=fs2::available_space(&state.root).unwrap_or(0);
+    let now=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let devices=state.devices.lock().map(|map|map.values().filter(|d|now.saturating_sub(d.last_seen)<45).cloned().collect::<Vec<_>>()).unwrap_or_default();
+    let transfers=state.transfers.lock().map(|map|map.len()).unwrap_or(0);
+    Json(serde_json::json!({"total":total,"free":free,"used":total.saturating_sub(free),"devices":devices,"active_transfers":transfers})).into_response()
+}
+async fn edit_share_text(State(state):State<AppState>,Json(body):Json<EditTextInput>)->Response {
+    if body.content.trim().is_empty() || body.content.chars().count()>MAX_SHARE_TEXT_CHARS {return json_error(StatusCode::BAD_REQUEST,"Invalid text content")}
+    let Ok(mut texts)=state.share_texts.lock() else {return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let mut proposed=texts.clone();
+    let Some(item)=proposed.iter_mut().find(|item|item.id==body.id) else {return StatusCode::NOT_FOUND.into_response()};
+    item.title=body.title.chars().take(100).collect();
+    item.content=body.content;
+    if let Err(e)=persist_share_texts(&state.root,&proposed){return json_error(StatusCode::INTERNAL_SERVER_ERROR,&e)}
+    *texts=proposed;
+    let _=state.changes.send("texts".into());
+    Json(serde_json::json!({"ok":true})).into_response()
+}
+
+
+#[derive(Deserialize)]
+struct ZipQuery { paths: String }
+
+async fn zip_selected(State(state):State<AppState>,headers:HeaderMap,Query(query):Query<ZipQuery>)->Response {
+    let Ok(paths)=serde_json::from_str::<Vec<String>>(&query.paths) else {return json_error(StatusCode::BAD_REQUEST,"Bad ZIP selection")};
+    if paths.is_empty() || paths.len()>500 {return json_error(StatusCode::BAD_REQUEST,"Select 1 to 500 items")}
+    let private=match state.private_files.lock(){Ok(p)=>p.clone(),Err(_)=>return json_error(StatusCode::INTERNAL_SERVER_ERROR,"Privacy unavailable")};
+    let admin=is_admin(&headers,&state);
+    let mut selections=Vec::<(PathBuf,String)>::new();
+    for raw in paths {
+        let key=rel_key(&raw);
+        if key.is_empty(){return json_error(StatusCode::BAD_REQUEST,"Cannot ZIP root")}
+        let Ok(full)=resolve_relative(&state.root,&key,true) else {return json_error(StatusCode::NOT_FOUND,"Selected path not found")};
+        if private_paths_in_directory(&private,&key).len()>0 && !admin {
+            return json_error(StatusCode::NOT_FOUND,"Selected path not available");
+        }
+        selections.push((full,key));
+    }
+    let root=state.root.clone();
+    let archive=tokio::task::spawn_blocking(move || -> Result<tempfile::NamedTempFile,String> {
+        let temp=tempfile::NamedTempFile::new_in(&root).map_err(|e|e.to_string())?;
+        let mut writer=zip::ZipWriter::new(temp);
+        let settings=zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
+        fn append(writer:&mut zip::ZipWriter<tempfile::NamedTempFile>,dir:&FsPath,rel:&str,root:&FsPath,settings:zip::write::FileOptions)->Result<(),String>{
+            let meta=fs::symlink_metadata(dir).map_err(|e|e.to_string())?;
+            if meta.file_type().is_symlink(){return Err("Symbolic links cannot be archived".into())}
+            if meta.is_dir(){
+                for entry in fs::read_dir(dir).map_err(|e|e.to_string())? {
+                    let entry=entry.map_err(|e|e.to_string())?;
+                    let name=entry.file_name().to_str().ok_or("Non-UTF8 filename")?.to_string();
+                    if safe_name(&name).is_none(){continue}
+                    let key=format!("{rel}/{name}");
+                    let full=resolve_relative(root,&key,true)?;
+                    append(writer,&full,&key,root,settings)?;
+                }
+            } else if meta.is_file() {
+                writer.start_file(rel.replace('\\',"/"),settings).map_err(|e|e.to_string())?;
+                let mut input=fs::File::open(dir).map_err(|e|e.to_string())?;
+                std::io::copy(&mut input,writer).map_err(|e|e.to_string())?;
+            }
+            Ok(())
+        }
+        for (full,rel) in selections {append(&mut writer,&full,&rel,&root,settings)?;}
+        writer.finish().map_err(|e|e.to_string())
+    }).await;
+    let temp=match archive {Ok(Ok(file))=>file,Ok(Err(error))=>return json_error(StatusCode::INTERNAL_SERVER_ERROR,&error),Err(e)=>return json_error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
+    let length=temp.as_file().metadata().map(|m|m.len()).unwrap_or(0);
+    let file=match tokio::fs::File::open(temp.path()).await{Ok(f)=>f,Err(e)=>return json_error(StatusCode::INTERNAL_SERVER_ERROR,&e.to_string())};
+    let stream=async_stream::stream! {
+        let mut file=file;
+        let temp=temp;
+        let mut buffer=vec![0_u8;64*1024];
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0)=>break,
+                Ok(n)=>yield Ok::<Bytes,std::io::Error>(Bytes::copy_from_slice(&buffer[..n])),
+                Err(e)=>{yield Err(e);break}
+            }
+        }
+        drop(file);
+        drop(temp);
+    };
+    let mut response=Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(header::CONTENT_TYPE,HeaderValue::from_static("application/zip"));
+    response.headers_mut().insert(header::CONTENT_DISPOSITION,HeaderValue::from_static("attachment; filename=blackbox-selection.zip"));
+    if let Ok(v)=HeaderValue::from_str(&length.to_string()){response.headers_mut().insert(header::CONTENT_LENGTH,v);}
+    response
+}
+
+#[derive(Deserialize)]
+struct PrivatePathInput {path:String,private:bool}
+async fn set_private_path(State(state):State<AppState>,headers:HeaderMap,Json(body):Json<PrivatePathInput>)->Response {
+    if !is_admin(&headers,&state){return json_error(StatusCode::UNAUTHORIZED,"Admin login required")}
+    let key=rel_key(&body.path);
+    let path=match resolve_relative(&state.root,&key,true){Ok(p)=>p,Err(e)=>return json_error(StatusCode::NOT_FOUND,&e)};
+    if !path.is_file(){return json_error(StatusCode::BAD_REQUEST,"Only files can be private")}
+    let Ok(mut files)=state.private_files.lock() else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let mut proposed=files.clone();
+    if body.private {proposed.insert(key);}else{proposed.remove(&key);}
+    if let Err(e)=persist_metadata(&state.root,&proposed){return json_error(StatusCode::INTERNAL_SERVER_ERROR,&e)}
+    *files=proposed;
+    let _=state.changes.send("files".into());
+    Json(serde_json::json!({"ok":true})).into_response()
+}
+
+fn spawn_folder_watcher(root:PathBuf,changes:broadcast::Sender<String>){
+    std::thread::spawn(move || {
+        use notify::Watcher;
+        let (tx,rx)=std::sync::mpsc::channel();
+        let Ok(mut watcher)=notify::recommended_watcher(move |event:notify::Result<notify::Event>|{
+            if let Ok(e)=event {
+                if e.paths.iter().any(|p|p.file_name().and_then(|n|n.to_str()).map(|s|!s.starts_with(".blackbox-")).unwrap_or(false)) {
+                    let _=tx.send(());
+                }
+            }
+        }) else {return};
+        if watcher.watch(&root,notify::RecursiveMode::Recursive).is_err(){return}
+        while rx.recv().is_ok(){
+            // Coalesce bursts from large folder moves and batch copies.
+            while rx.recv_timeout(Duration::from_millis(180)).is_ok(){}
+            let _=changes.send("files".into());
+        }
+    });
 }
 
 // MoveFileW does not replace existing targets, unlike std::fs::rename on
@@ -812,7 +1225,30 @@ async fn main() {
         admin_password_hash: Arc::new(Mutex::new(load_app_config().admin_password_hash)),
         failed_logins: Arc::new(Mutex::new(HashMap::new())),
         upload_slots: Arc::new(Semaphore::new(MAX_PARALLEL_UPLOADS)),
+        transfers: Arc::new(Mutex::new(HashMap::new())),
+        finished_transfers: Arc::new(Mutex::new(HashMap::new())),
+        devices: Arc::new(Mutex::new(HashMap::new())),
+        changes: broadcast::channel(256).0,
     };
+    spawn_folder_watcher(state.root.clone(), state.changes.clone());
+    let cleanup_state=state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+            if let Ok(mut sessions)=cleanup_state.transfers.lock() {
+                sessions.retain(|_,session| {
+                    if session.touched.elapsed() >= Duration::from_secs(24*60*60) {
+                        let _=fs::remove_file(&session.temporary);
+                        false
+                    } else {true}
+                });
+            }
+            if let Ok(mut done)=cleanup_state.finished_transfers.lock(){
+                done.retain(|_,(_,at)|at.elapsed() < Duration::from_secs(24*60*60));
+            }
+            cleanup_stale_uploads(&cleanup_state.root);
+        }
+    });
     let app = Router::new()
         .route("/", get(index))
         .route("/api/files", get(list_files))
@@ -824,9 +1260,22 @@ async fn main() {
         .route("/api/logout", post(logout))
         .route("/api/auth", get(auth_status))
         .route("/api/startup", get(get_startup).post(update_startup))
-        .route("/api/upload", post(upload).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)))
+        .route("/api/upload", post(upload).layer(DefaultBodyLimit::disable()))
         .route("/api/private/:name", post(set_private))
-        .route("/download/:name", get(download))
+        .route("/download/*name", get(download_nested))
+        .route("/api/tree", get(list_tree))
+        .route("/api/manage", post(manage_file))
+        .route("/api/folder", post(create_folder))
+        .route("/api/chunks", post(upload_chunk).get(query_chunk).layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES)))
+        .route("/api/chunks/cancel", post(cancel_chunk))
+        .route("/api/events", get(event_stream))
+        .route("/api/presence", post(heartbeat))
+        .route("/api/dashboard", get(dashboard))
+        .route("/api/texts/edit", post(edit_share_text))
+        .route("/api/zip", get(zip_selected))
+        .route("/api/private-path", post(set_private_path))
+        .route("/app.js", get(|| async {([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")], include_str!("../web/app.js"))}))
+        .route("/qr.js", get(|| async {([(header::CONTENT_TYPE,"text/javascript; charset=utf-8")], include_str!("../web/qr.js"))}))
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .with_state(state);
 
@@ -940,5 +1389,34 @@ mod tests {
         let secret = tempfile::NamedTempFile::new().unwrap();
         symlink(secret.path(), root.join("linked-file.txt")).unwrap();
         assert!(safe_existing_file(&root, "linked-file.txt").is_none());
+    }
+}
+
+#[cfg(test)]
+mod v12_tests {
+    use super::*;
+    #[test]
+    fn nested_paths_resolve_without_escaping() {
+        let tmp=tempfile::tempdir().unwrap();
+        let root=fs::canonicalize(tmp.path()).unwrap();
+        fs::create_dir(root.join("docs")).unwrap();
+        fs::write(root.join("docs/report.pdf"),b"demo").unwrap();
+        assert!(resolve_relative(&root,"docs/report.pdf",true).unwrap().is_file());
+        assert!(resolve_relative(&root,"docs/new.pdf",false).is_ok());
+        for forbidden in ["../secrets","docs/../secrets","docs//report.pdf",".blackbox-private","share-texts.json"] {
+            assert!(resolve_relative(&root,forbidden,true).is_err());
+        }
+    }
+    #[test]
+    fn directory_private_keys_follow_a_move() {
+        let files=HashSet::from(["documents/report.pdf".to_string(),"other.txt".to_string()]);
+        let entries=private_paths_in_directory(&files,"documents");
+        assert_eq!(entries,vec!["documents/report.pdf"]);
+    }
+    #[test]
+    fn no_per_file_upload_cap_is_configured() {
+        // Multipart and resumable endpoints stream to disk. The request cap
+        // applies only to individual 4 MiB chunk requests.
+        assert!(MAX_REQUEST_BYTES >= 4*1024*1024);
     }
 }

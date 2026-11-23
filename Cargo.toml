@@ -1,6 +1,6 @@
 [package]
 name = "blackbox-share"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 
 [dependencies]
@@ -17,9 +17,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 open = "5"
 argon2 = "0.5"
 fs2 = "0.4"
-
-[dev-dependencies]
+async-stream = "0.3"
+tokio-stream = "0.1"
+zip = "0.6"
 tempfile = "3"
+notify = "6"
+
 
 [target.'cfg(windows)'.dependencies]
 muda = "0.15"
